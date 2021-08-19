@@ -94,6 +94,7 @@ specific usage instructions and other useful information.
 
 <!--
 
+<<<<<<< HEAD
 The table is manually sorted to keep certain device families, like confusing
 generations of Corsair coolers and NZXT Smart Devices, in chronological order.
 
