@@ -396,6 +396,15 @@ class _UploadType(Enum):
     BANNER = 0
     GIF = 1
 
+@unique
+class _ScreenMode(Enum):
+    HARDWARE = 0
+    IMAGE =  1
+    BANNER = 3
+    CLOCK = 4
+    SETTINGS = 5
+    DISABLED = 6
+
 
 class MpgCooler(UsbHidDriver):
     _COLOR_MODES = {
@@ -448,12 +457,29 @@ class MpgCooler(UsbHidDriver):
         "default": _FanMode.DEFAULT.value,
         "smart": _FanMode.SMART.value,
     }
-
+    SCREEN_MODES = {
+        "hardware": _ScreenMode.HARDWARE,
+        "image": _ScreenMode.IMAGE,
+        "banner": _ScreenMode.BANNER,
+        "clock": _ScreenMode.CLOCK,
+        "settings": _ScreenMode.SETTINGS,
+        "disable": _ScreenMode.DISABLED,
+    }
+    HWMONITORDISPLAY = {
+        "cpu_freq": _OLEDHardwareMonitorOffset.CPU_FREQ,
+        "cpu_temp": _OLEDHardwareMonitorOffset.CPU_TEMP,
+        "gpu_freq": _OLEDHardwareMonitorOffset.GPU_MEMORY_FREQ,
+        "gpu_usage": _OLEDHardwareMonitorOffset.GPU_USAGE,
+        "fan_pump": _OLEDHardwareMonitorOffset.FAN_PUMP,
+        "fan_radiator": _OLEDHardwareMonitorOffset.FAN_RADIATOR,
+        "fan_cpumos": _OLEDHardwareMonitorOffset.FAN_CPUMOS,
+    }
     _MATCHES = [
         (0x0DB0, 0xB130, "MSI MPG Coreliquid K360", {"fan_count": 5}),
         (0x0DB0, 0xCA00, "Unknown", {}),
         (0x0DB0, 0xCA02, "Unknown", {}),
     ]
+    HAS_AUTOCONTROL = True
 
     def __init__(self, device, description, **kwargs):
         super().__init__(device, description, **kwargs)
@@ -556,6 +582,13 @@ class MpgCooler(UsbHidDriver):
             ##    ('Temperature sensor 1', array[16] + (array[17] << 8), '°C'),
             ##    ('Temperature sensor 2', array[18] + (array[19] << 8), '°C'),
         ]
+    
+    def set_time(self, time):
+        return self.set_oled_clock(time)
+    
+    def set_hardware_status(self, T, cpu_f=0, gpu_f=0, gpu_U=0, **kwargs):
+        self.set_oled_show_cpu_status(cpu_f, T)
+        self.set_oled_gpu_status(gpu_f, gpu_U)
 
     def get_fan_config(self):
         self._write((0x32,))
@@ -696,20 +729,49 @@ class MpgCooler(UsbHidDriver):
 
     def set_screen(self, channel, mode, value, **kwargs):
         assert channel.lower() == "oled"
-        assert mode != None, "Mode needs a value"
+        try:
+            mode = self.SCREEN_MODES[mode]
+        except KeyError as e:
+            raise Exception(f"Unknown screen mode! Should be one of: {self.SCREEN_MODES.keys()}") from e
 
-        if mode == "preloaded":
-            assert (
-                len(value) == 2
-            ), "Please provide two numbers as the indices of the image to show, example: '10'"
-            type, num = map(int, value)
-            self.set_oled_show_profile(type, num)
-        if mode == "upload":
-            idx, file = value.split()
-            idx = int(idx)
-            bmp_img = self._prepare_bmp(file)
-            self.set_oled_upload_gif(bmp_img, idx)
-            # self.set_oled_show_profile(1,idx)
+        if mode == _ScreenMode.HARDWARE:
+            show_idx = [self.HWMONITORDISPLAY[x].value for x in value.split(" ")]
+            show_area = [i in show_idx for i in range(_OLEDHardwareMonitorOffset.MAXIMUM.value + 1)]
+            self.set_oled_show_hardware_monitor(show_area)
+        if mode == _ScreenMode.IMAGE:
+            values = value.split(';')
+            imgtype,idx = map(int,values[:2])
+            if len(values) > 2:
+                assert imgtype == 1, "Cannot override default images (image type 0)"
+                file = values[2]
+                bmp_img = self._prepare_bmp(file)
+                self.set_oled_upload_gif(bmp_img, idx)
+            self.set_oled_show_profile(imgtype, idx)
+        elif mode == _ScreenMode.BANNER:
+            opts = value.split(';')
+            if len(opts) == 3:
+                banner_type, save_slot = opts[:2]
+                message = opts[2]
+                self.set_oled_user_message(message)
+                self.set_oled_show_banner(banner_type=int(banner_type), bmp_no=int(save_slot))
+            elif len(opts) == 4:
+                banner_type, save_slot, message, image_file = opts
+                banner_type, save_slot = map(int, (banner_type, save_slot))
+                img = self._prepare_bmp(image_file)
+                assert save_slot >= 4, "Cannot overwrite preset banner images, "\
+                    "please use save slots starting from 4 for your uploaded files"
+                print("here")
+                self.set_oled_upload_banner(img, banner_no = save_slot)
+                self.set_oled_user_message(message)
+                self.set_oled_show_banner(banner_type=banner_type, bmp_no=save_slot)
+        elif mode == _ScreenMode.CLOCK:
+            style = int(value)
+            self.set_oled_show_clock(style)
+        elif mode == _ScreenMode.SETTINGS:
+            brightness, direction = [int(x) for x in value.split(';')]
+            self.set_oled_brightness_and_direction(brightness=brightness, direction=direction)
+        elif mode == _ScreenMode.DISABLED:
+            self.set_oled_show_disable()
 
     def _prepare_bmp(self, path):
         end_w, end_h = 240, 320
@@ -892,12 +954,21 @@ class MpgCooler(UsbHidDriver):
         return self._write([0x90] + list(message[:60].encode("ascii", "ignore")))
 
     def set_oled_show_hardware_monitor(self, show_area, radiator_fan_smart_mode_on_off=True):
+        """
+        
+        Parameters
+        ----------
+        show_area:
+            Array[bool] Indicates which hardware features will be presented on the screen,
+                        from CPU_FREQ, CPU_TEMP, GPU_MEMORY_FREQ, GPU_USAGE, FAN_PUMP, FAN_RADIATOR, FAN_CPUMOS
+        """
         if len(show_area) < 7:
             return False
         buf = bytearray(_REPORT_LENGTH)
         buf[0] = 0xD0
         buf[1] = 0x71
         for item in iter(_OLEDHardwareMonitorOffset):
+            print(item.value)
             if item.value != _OLEDHardwareMonitorOffset.MAXIMUM and show_area[item.value]:
                 buf[item.value + 2] = 1
             if show_area[5]:
@@ -1045,6 +1116,7 @@ class MpgCooler(UsbHidDriver):
         return self._write((0x7F,))
 
     def _set_oled_upload(self, type, bytes, type_num=0):
+        print(type == _UploadType.GIF)
         start_cmd = 0xC0 if type == _UploadType.GIF else 0xD0
         content = bytes.getbuffer()
         l = len(content)
@@ -1076,18 +1148,17 @@ class MpgCooler(UsbHidDriver):
         """
         self._set_oled_upload(_UploadType.GIF, bytes, gif_no)
 
-    def set_oled_upload_banner(self, filename, banner_no=4):
+    def set_oled_upload_banner(self, bytes, banner_no=4):
         """Default is 4 to not overwrite the default banners.
 
         --upload-banner-file
         --upload-banner-number
         """
-        self._set_oled_upload(_UploadType.BANNER, filename, banner_no)
+        self._set_oled_upload(_UploadType.BANNER, bytes, banner_no)
 
     def set_oled_clock(self, time):
         """
-        --set-oled-clock now
-        --set-old-clock ISOTIME
+        Sends the specified time to the device. 
         """
         return self._write(
             (
